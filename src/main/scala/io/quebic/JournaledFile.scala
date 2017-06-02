@@ -6,10 +6,11 @@ import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
 
 import io.quebic.JournaledFile.offset
+import org.slf4j.LoggerFactory
 
 import scala.annotation.tailrec
 
-private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capacity:Long) extends AutoCloseable {
+private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoCloseable {
   private[this] val path = file.toPath
   private val fc = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
   private[this] val lock = fc.lock()
@@ -71,29 +72,23 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
     * @param values      ジャーナルに追加するデータ
     * @param lifetime    データの有効期限を示す現在時刻からの相対時間 (ミリ秒)。負の値を指定した場合は有効期限なし
     * @param compression データの圧縮方法
-    * @return 追加を行った場合 true、このジャーナルに capacity 以上のデータが存在していて追加を行わなかった場合 false
     */
-  def push(values:Struct, lifetime:Long = -1, compression:CompressionType = CompressionType.NONE):Boolean = {
+  def push(values:Struct, lifetime:Long = -1, compression:CompressionType = CompressionType.NONE):Unit = {
 
     // 現在のエントリ数を取得
     val currentItems = header.currentItems
-    if((currentItems < 0 && currentItems == Long.MaxValue) || currentItems >= capacity) {
-      false
-    } else {
 
-      // データとエントリの書き込み
-      val serializedValues = schema.serialize(values, compression)
-      val previous = header.lastPosition
-      val regionOffset = fc.size()
-      val entryOffset = writeDataWithEntry(regionOffset, serializedValues, previous, lifetime, compression.id)
+    // データとエントリの書き込み
+    val serializedValues = schema.serialize(values, compression)
+    val previous = header.lastPosition
+    val regionOffset = fc.size()
+    val entryOffset = writeDataWithEntry(regionOffset, serializedValues, previous, lifetime, compression.id)
 
-      // ヘッダの更新
-      header.currentItems = currentItems + 1
-      header.lastPosition = entryOffset
+    // ヘッダの更新
+    header.currentItems = currentItems + 1
+    header.lastPosition = entryOffset
 
-      fc.force(true)
-      true
-    }
+    fc.force(true)
   }
 
   /**
@@ -127,8 +122,16 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
     *         ない場合 `Right(None)`、`f` の処理中に例外が発生した場合 `Left[Throwable]`
     */
   def consume[T](errorPermitCount:Short = 3)(f:(Struct) => T):Either[Throwable, Option[T]] = {
-    consumeEntryWithData(errorPermitCount) { case (_, dataBuffer) =>
-      f(schema.deserialize(dataBuffer))
+    consumeEntryWithData(errorPermitCount) { case (entryBuffer, dataBuffer) =>
+      val data = try {
+        schema.deserialize(dataBuffer)
+      } catch {
+        case ex:Exception =>
+          val ent = JournaledFile.dumpEntry(entryBuffer)
+          val bin = (0 until dataBuffer.limit()).map(i => f"${dataBuffer.get(i)}%02X").mkString
+          throw new FormatException(s"deserialization failed: schema=$schema, entry=[$ent], buffer=$bin", ex)
+      }
+      f(data)
     }
   }
 
@@ -140,7 +143,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
     if(entryOffset < 0) {
       Right(None)
     } else {
-      assert(entryOffset > header.size)
+      assert(entryOffset >= header.size, f"invalid entry offset: $entryOffset%,d < ${header.size}%,d")
 
       // 末尾のエントリとデータを読み込み
       val entryBuffer = ByteBuffer.allocate(JournaledFile.ENTRY_SIZE)
@@ -219,6 +222,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
     val now = System.currentTimeMillis()
     val dataLength = dataBuffer.limit()
     val entryBuffer = ByteBuffer.allocate(JournaledFile.ENTRY_SIZE)
+    entryBuffer.put(JournaledFile.EntrySignature)
     entryBuffer.putLong(prevEntryOffset) // previous entry offset from head of file
     entryBuffer.putLong(now) // created at as milli sec
     entryBuffer.putLong(if(lifetime < 0) -1 else now + lifetime) // expires at as milli sec
@@ -268,8 +272,14 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
   private def readEntry(entryOffset:Long, entryBuffer:ByteBuffer):ByteBuffer = {
     entryBuffer.clear()
     assert(entryBuffer.limit() == JournaledFile.ENTRY_SIZE)
-    fc.read(entryBuffer, entryOffset)
+    val len = fc.read(entryBuffer, entryOffset)
+    if(len < JournaledFile.ENTRY_SIZE){
+      throw new FormatException(f"entry too short: $len%,dB < ${JournaledFile.ENTRY_SIZE}%,d, offset=0x$entryOffset%X")
+    }
     entryBuffer.flip()
+    if(entryBuffer.get(offset.ENTRY_SIG) != JournaledFile.EntrySignature){
+      throw new FormatException(f"invalid entry signature: ${entryBuffer.get(offset.ENTRY_SIG)&0xFF}%02X != ${JournaledFile.EntrySignature}%02X, offset=0x$entryOffset%X")
+    }
     entryBuffer
   }
 
@@ -282,7 +292,14 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
     */
   private def readData(entryOffset:Long, dataLength:Int):ByteBuffer = {
     val dataBuffer = ByteBuffer.allocate(dataLength)
-    fc.read(dataBuffer, entryOffset + JournaledFile.ENTRY_SIZE)
+    val dataOffset = entryOffset + JournaledFile.ENTRY_SIZE
+    val len = fc.read(dataBuffer, dataOffset)
+    if(len < 0){
+      throw new FormatException(f"data region over-run journal: data-offset data-offset=0x$dataOffset%X, data-length=$dataLength%,dB, file-size=${fc.size()}%X, entry-offset=0x$entryOffset%X")
+    }
+    if(len < dataLength){
+      throw new FormatException(f"data region too short: $len%,dB < $dataLength%,d, offset=0x$entryOffset%X")
+    }
     dataBuffer.flip()
     dataBuffer
   }
@@ -299,20 +316,25 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
     // キュー側に空ける必要のある領域サイズを計算
     val (entryCount, totalDataLength, _) = inspect()
     if(entryCount > 0) {
+      JournaledFile.logger.debug(f"migrating $entryCount%,d entries ($totalDataLength%,dB)")
+      this.verify()
+      queue.verify()
+
       val minimumSize = totalDataLength + entryCount * JournaledFile.ENTRY_SIZE
       val (_, _, maxDataLength) = queue.inspect()
       val spaceOutSize = math.max(maxDataLength + JournaledFile.ENTRY_SIZE, minimumSize)
       val deepestEntryOffset = queue.spaceOut(spaceOutSize)
+      queue.verify()
 
       // このジャーナルの要素をキューへ移動
-      val (dstLastNewEntryOffset, _) =
-        aggregate((-1L, queue.header.size.toLong)) { case (entryBuffer, srcEntryOffset, (dstPrevEntryOffset, dstRegionOffset)) =>
-          val dataLength = entryBuffer.getInt(offset.DATA_LENGTH)
-          val dataBuffer = readData(srcEntryOffset, dataLength)
-          entryBuffer.putLong(offset.PREVIOUS, dstPrevEntryOffset)
-          val dstEntryOffset = queue.writeDataWithEntry(dstRegionOffset, dataBuffer, entryBuffer)
-          (dstEntryOffset, dstRegionOffset + JournaledFile.ENTRY_SIZE + dataLength)
-        }
+      val (dstLastNewEntryOffset, _) = aggregate((-1L, queue.header.size.toLong)) { case (entryBuffer, srcEntryOffset, (dstPrevEntryOffset, dstRegionOffset)) =>
+        val dataLength = entryBuffer.getInt(offset.DATA_LENGTH)
+        val dataBuffer = readData(srcEntryOffset, dataLength)
+        entryBuffer.putLong(offset.PREVIOUS, dstPrevEntryOffset)
+        val dstEntryOffset = queue.writeDataWithEntry(dstRegionOffset, dataBuffer, entryBuffer)
+        (dstEntryOffset, dstRegionOffset + JournaledFile.ENTRY_SIZE + dataLength)
+      }
+      queue.verify()
 
       // メタ情報を更新して新しいエントリを連結
       if(deepestEntryOffset >= 0) {
@@ -326,7 +348,20 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
       // このジャーナルの内容を破棄
       fc.truncate(0) // ファイルオープン中に delete() できないケースを想定して 0 バイトに削除
       file.delete()
+      queue.verify()
     }
+  }
+
+  def verify():Unit = aggregate(fc.size()) { case (entryBuffer, entryOffset, rightEntryOffset) =>
+    val dataLength = entryBuffer.getInt(offset.DATA_LENGTH)
+    if(dataLength <= 0){
+      val ent = JournaledFile.dumpEntry(entryBuffer)
+      throw new FormatException(f"invalid data length: [0x$entryOffset%X] $ent")
+    }
+    if(entryOffset + JournaledFile.ENTRY_SIZE + dataLength > rightEntryOffset){
+      throw new FormatException(f"entry over-run: 0x$entryOffset%X + ${JournaledFile.ENTRY_SIZE}%,dB + $dataLength%,dB = 0x${entryOffset+JournaledFile.ENTRY_SIZE+dataLength}%X > right 0x$rightEntryOffset%X")
+    }
+    entryOffset
   }
 
   /**
@@ -350,39 +385,28 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
 
     val (pointer, _) = aggregate((offset.LAST_POSITION.toLong, fc.size() + size)) { case (entryBuffer, entryOffset, (prevPointerOffset, entryTailOffset)) =>
 
-      // エントリの移動でエントリ領域がオーバーラップしないことを確認
-      val newEntryOffset = entryTailOffset - JournaledFile.ENTRY_SIZE
-      if(entryOffset + JournaledFile.ENTRY_SIZE > newEntryOffset) {
-        throw new IllegalArgumentException(
-          f"new entry region is overlapped; space-out size $size%,d must be larger than entry size ${JournaledFile.ENTRY_SIZE}%,d")
-      }
-
-      // エントリの読み込み
-      entryBuffer.clear()
-      fc.read(entryBuffer, entryOffset)
-      entryBuffer.flip()
-      val dataOffset = entryOffset + JournaledFile.ENTRY_SIZE
-
-      // データの移動でデータ領域がオーバーラップしないことを確認
+      // エントリとデータの移動で領域がオーバーラップしないことを確認
       val dataLength = entryBuffer.getInt(offset.DATA_LENGTH)
-      val newDataOffset = newEntryOffset - dataLength
-      if(dataOffset - dataLength > newDataOffset) {
+      val newEntryOffset = entryTailOffset - JournaledFile.ENTRY_SIZE - dataLength
+      if(entryOffset + JournaledFile.ENTRY_SIZE + dataLength > newEntryOffset) {
         throw new IllegalArgumentException(
-          f"new data region is overlapped; space-out size $size%,d must be larger than data size $dataLength%,d")
+          f"new entry region is overlapped; space-out size $size%,d must be larger than entry size ${JournaledFile.ENTRY_SIZE+dataLength}%,d bytes")
       }
-
-      // エントリと新しいエントリ位置の書き込み (データの移動により潰れる可能性があるため先に書き込む必要がある)
-      fc.write(entryBuffer, newEntryOffset)
-      raw.writeLong(prevPointerOffset, newEntryOffset)
 
       // データの移動
+      val dataOffset = entryOffset + JournaledFile.ENTRY_SIZE
+      val newDataOffset = newEntryOffset + JournaledFile.ENTRY_SIZE
       val dataBuffer = ByteBuffer.allocate(dataLength)
       val readDataLength = fc.read(dataBuffer, dataOffset)
       dataBuffer.flip()
       assert(readDataLength == dataLength)
       fc.write(dataBuffer, newDataOffset)
 
-      (newEntryOffset + offset.PREVIOUS, newDataOffset)
+      // エントリと新しいエントリ位置の書き込み
+      fc.write(entryBuffer, newEntryOffset)
+      raw.writeLong(prevPointerOffset, newEntryOffset)
+
+      (newEntryOffset + offset.PREVIOUS, newEntryOffset)
     }
 
     if(pointer == offset.LAST_POSITION) -1 else pointer - offset.PREVIOUS
@@ -409,9 +433,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
       _aggregate(prevEntryOffset, newValue)
     }
 
-    val longBuffer = ByteBuffer.allocate(java.lang.Long.BYTES)
-    fc.read(longBuffer, offset.LAST_POSITION)
-    _aggregate(longBuffer.getLong, zero)
+    _aggregate(header.lastPosition, zero)
   }
 
   /**
@@ -425,7 +447,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
 
     // ヘッダサイズの確認
     if(fc.size() < header.size) {
-      throw new FormatException(f"${if(fifo) "queue" else "journal"} file is too short, actual ${fc.size()},dB < expected ${header.size}%,dB")
+      throw new FormatException(f"journal file is too short, actual ${fc.size()},dB < expected ${header.size}%,dB")
     }
 
     val buffer = ByteBuffer.allocate(header.size)
@@ -437,7 +459,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
       throw new FormatException(f"invalid magic number, actual 0x${magicNumber & 0xFFFF}%04X != expected 0x${JournaledFile.MagicNumber}%04X")
     }
 
-    // スキーマの確認
+    // スキーマの互換性確認
     buffer.position(offset.SCHEMA)
     val existing = Schema(buffer)
     if(schema.types.length != existing.types.length || !schema.types.zip(existing.types).forall(x => x._1.id == x._2.id)) {
@@ -452,7 +474,19 @@ private[quebic] class JournaledFile(file:File, schema:Schema, fifo:Boolean, capa
 }
 
 private[quebic] object JournaledFile {
+  private[JournaledFile] val logger = LoggerFactory.getLogger(classOf[JournaledFile])
   val MagicNumber:Short = ((('Q' & 0xFF) << 8) | ('B' & 0xFF)).toShort
+  val EntrySignature:Byte = '@'
+
+  def dumpEntry(entryBuffer:ByteBuffer):String = {
+    val sig = entryBuffer.get(offset.ENTRY_SIG)
+    val prev = entryBuffer.getLong(offset.PREVIOUS)
+    val tm = entryBuffer.getLong(offset.CREATED_AT)
+    val err = entryBuffer.getShort(offset.ERRORS) & 0xFFFF
+    val len = entryBuffer.getInt(offset.DATA_LENGTH)
+    val cmp = entryBuffer.get(offset.COMPRESSION) & 0xFF
+    f"sig=0x$sig%02X, prev=0x$prev%X, created=$tm%tF $tm%tT, errors=$err%,d, data-length=$len%,dB, compress=$cmp%d"
+  }
 
   object offset {
     val MAGIC_NUMBER:Int = 0
@@ -461,7 +495,8 @@ private[quebic] object JournaledFile {
     val LAST_POSITION:Int = CURRENT_ITEMS + java.lang.Long.BYTES
     val SCHEMA:Int = LAST_POSITION + java.lang.Long.BYTES
 
-    val PREVIOUS:Int = 0
+    val ENTRY_SIG:Int = 0
+    val PREVIOUS:Int = ENTRY_SIG + java.lang.Byte.BYTES
     val CREATED_AT:Int = PREVIOUS + java.lang.Long.BYTES
     val EXPIRES_AT:Int = CREATED_AT + java.lang.Long.BYTES
     val ERRORS:Int = EXPIRES_AT + java.lang.Long.BYTES

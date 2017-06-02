@@ -143,7 +143,6 @@ object DataType2 {
     override def write(value:Any, out:DataOutputStream):Unit = {
       val stringValue:String = value match {
         case s:String => s
-        case s:java.lang.String => s
       }
       BINARY.write(stringValue.getBytes(StandardCharsets.UTF_8), out)
     }
@@ -213,7 +212,6 @@ object DataType2 {
     case l:java.lang.Long => l
     case b:java.lang.Boolean => if(b) 1 else 0
     case s:String => s.toLong
-    case s:java.lang.String => s.toLong
   }
 
   private[DataType2] val LongToAny:Map[Class[_], (Long) => Any] = Map(
@@ -240,7 +238,6 @@ object DataType2 {
     case f:java.lang.Float => f.toDouble
     case d:java.lang.Double => d
     case s:String => s.toDouble
-    case s:java.lang.String => s.toDouble
   }
 
   private[DataType2] val DoubleToAny:Map[Class[_], (Double) => Any] = Map(

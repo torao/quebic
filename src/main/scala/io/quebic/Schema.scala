@@ -5,6 +5,8 @@ import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.zip.GZIPOutputStream
 
+import org.slf4j.LoggerFactory
+
 case class Schema(types:DataType*) {
   if(types.length > Limits.MaxColumnSize) {
     throw new FormatException(f"too many schema types: ${types.length},d > ${Limits.MaxColumnSize},d")
@@ -78,6 +80,7 @@ case class Schema(types:DataType*) {
 }
 
 object Schema {
+  private[Schema] val logger = LoggerFactory.getLogger(classOf[Schema])
 
   /**
     * 指定されたバッファの現在の位置からスキーマを読み込んで復元します。
