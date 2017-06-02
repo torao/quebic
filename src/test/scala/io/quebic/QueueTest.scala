@@ -36,11 +36,14 @@ push and pop in single thread: $normalPushAndPopInSingleThread
     val expected = (0 until capacity).map{ i => randomString(i, i) }
     val publish = new queue.Publisher()
     val subscribe = new queue.Subscriber()
+    val t0 = System.currentTimeMillis()
     expected.foreach{ s => publish.push(s) }
-    System.out.println(f"${expected.length} pushed queue size: ${queue.diskSpace}%,dB")
+    val t1 = System.currentTimeMillis()
+    System.out.println(f"${expected.length} pushed queue size: ${queue.diskSpace}%,dB [${t1-t0}%,dms]")
     val pushedSizeEqualsItemCount = queue.size === expected.length
     val actual = expected.indices.map{ _ => subscribe.pop() }
-    System.out.println(f"${actual.length} popped queue size: ${queue.diskSpace}%,dB")
+    val t2 = System.currentTimeMillis()
+    System.out.println(f"${actual.length} popped queue size: ${queue.diskSpace}%,dB [${t2-t1}%,dms]")
     val elementAllPoped = queue.size === 0
     val poppedElementsAreAllRetrieved = actual.length === expected.length
     val poppedElementsAreAllEquals = actual.zip(expected).map(x => x._1 === x._2).reduceLeft(_ and _)

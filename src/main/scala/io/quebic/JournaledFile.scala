@@ -1,11 +1,12 @@
 package io.quebic
 
-import java.io.File
+import java.io.{File, PrintWriter, StringWriter}
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
+import java.text.SimpleDateFormat
 
-import io.quebic.JournaledFile.offset
+import io.quebic.JournaledFile.{logger, offset}
 import org.slf4j.LoggerFactory
 
 import scala.annotation.tailrec
@@ -61,7 +62,28 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     }
   }
 
-  def size:Long = header.currentItems
+  /**
+    * このジャーナルに含まれているデータ数を参照します。この値はキャッシュされたものであり、プロセスの強制停止などに
+    * よって実際に参照可能なデータ数と異なる可能性があります。ただし、ジャーナル内にデータが存在するかを確認するために
+    * 0 か 0 以外かは正確な評価を行うことができます。
+    *
+    * @return このジャーナルに含まれているデータ数
+    */
+  def size:Long = {
+    val size = header.currentItems
+    val fileSize = fc.size()
+    val correctSize = if(size == 0 && fileSize > header.size) {
+      val (entryCount, _, _) = inspect()
+      entryCount
+    } else if(fileSize == header.size && size > 0){
+      0L
+    } else size
+    if(correctSize != size){
+      logger.debug(f"correcting the number of items: $size%,d -> $correctSize%,d")
+      header.currentItems = correctSize
+    }
+    correctSize
+  }
 
   /**
     * 指定されたデータをこのジャーナルに追加します。
@@ -87,8 +109,6 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     // ヘッダの更新
     header.currentItems = currentItems + 1
     header.lastPosition = entryOffset
-
-    fc.force(true)
   }
 
   /**
@@ -179,14 +199,12 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
         header.currentItems = if(previousEntryOffset < 0) 0 else header.currentItems = header.currentItems - 1
         header.lastPosition = previousEntryOffset
         fc.truncate(entryOffset)
-        fc.force(true)
         result
       } else {
         // 失敗している場合はエントリを更新
         entryBuffer.position(0)
         assert(entryBuffer.limit() == JournaledFile.ENTRY_SIZE)
         fc.write(entryBuffer, entryOffset)
-        fc.force(true)
         result
       }
     }
@@ -273,12 +291,12 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     entryBuffer.clear()
     assert(entryBuffer.limit() == JournaledFile.ENTRY_SIZE)
     val len = fc.read(entryBuffer, entryOffset)
-    if(len < JournaledFile.ENTRY_SIZE){
+    if(len < JournaledFile.ENTRY_SIZE) {
       throw new FormatException(f"entry too short: $len%,dB < ${JournaledFile.ENTRY_SIZE}%,d, offset=0x$entryOffset%X")
     }
     entryBuffer.flip()
-    if(entryBuffer.get(offset.ENTRY_SIG) != JournaledFile.EntrySignature){
-      throw new FormatException(f"invalid entry signature: ${entryBuffer.get(offset.ENTRY_SIG)&0xFF}%02X != ${JournaledFile.EntrySignature}%02X, offset=0x$entryOffset%X")
+    if(entryBuffer.get(offset.ENTRY_SIG) != JournaledFile.EntrySignature) {
+      throw new FormatException(f"invalid entry signature: ${entryBuffer.get(offset.ENTRY_SIG) & 0xFF}%02X != ${JournaledFile.EntrySignature}%02X, offset=0x$entryOffset%X")
     }
     entryBuffer
   }
@@ -294,10 +312,10 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     val dataBuffer = ByteBuffer.allocate(dataLength)
     val dataOffset = entryOffset + JournaledFile.ENTRY_SIZE
     val len = fc.read(dataBuffer, dataOffset)
-    if(len < 0){
+    if(len < 0) {
       throw new FormatException(f"data region over-run journal: data-offset data-offset=0x$dataOffset%X, data-length=$dataLength%,dB, file-size=${fc.size()}%X, entry-offset=0x$entryOffset%X")
     }
-    if(len < dataLength){
+    if(len < dataLength) {
       throw new FormatException(f"data region too short: $len%,dB < $dataLength%,d, offset=0x$entryOffset%X")
     }
     dataBuffer.flip()
@@ -316,7 +334,8 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     // キュー側に空ける必要のある領域サイズを計算
     val (entryCount, totalDataLength, _) = inspect()
     if(entryCount > 0) {
-      JournaledFile.logger.debug(f"migrating $entryCount%,d entries ($totalDataLength%,dB)")
+      val t0 = System.currentTimeMillis()
+
       this.verify()
       queue.verify()
 
@@ -342,24 +361,28 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
       } else {
         queue.header.lastPosition = dstLastNewEntryOffset
       }
-      queue.header.currentItems = header.currentItems + entryCount
-      queue.fc.force(true)
+      queue.header.currentItems = queue.header.currentItems + entryCount
 
       // このジャーナルの内容を破棄
       fc.truncate(0) // ファイルオープン中に delete() できないケースを想定して 0 バイトに削除
       file.delete()
       queue.verify()
+
+      if(logger.isDebugEnabled) {
+        val t = System.currentTimeMillis() - t0
+        logger.debug(f"${file.getName}%s migrated: $entryCount%,d entries ($totalDataLength%,dB) move to queue, total ${queue.size}%,d entries, $t%,d[ms]")
+      }
     }
   }
 
   def verify():Unit = aggregate(fc.size()) { case (entryBuffer, entryOffset, rightEntryOffset) =>
     val dataLength = entryBuffer.getInt(offset.DATA_LENGTH)
-    if(dataLength <= 0){
+    if(dataLength <= 0) {
       val ent = JournaledFile.dumpEntry(entryBuffer)
       throw new FormatException(f"invalid data length: [0x$entryOffset%X] $ent")
     }
-    if(entryOffset + JournaledFile.ENTRY_SIZE + dataLength > rightEntryOffset){
-      throw new FormatException(f"entry over-run: 0x$entryOffset%X + ${JournaledFile.ENTRY_SIZE}%,dB + $dataLength%,dB = 0x${entryOffset+JournaledFile.ENTRY_SIZE+dataLength}%X > right 0x$rightEntryOffset%X")
+    if(entryOffset + JournaledFile.ENTRY_SIZE + dataLength > rightEntryOffset) {
+      throw new FormatException(f"entry over-run: 0x$entryOffset%X + ${JournaledFile.ENTRY_SIZE}%,dB + $dataLength%,dB = 0x${entryOffset + JournaledFile.ENTRY_SIZE + dataLength}%X > right 0x$rightEntryOffset%X")
     }
     entryOffset
   }
@@ -370,9 +393,17 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     *
     * @return (エントリ数, 合計データサイズ, 最大データサイズ)
     */
-  private def inspect():(Long, Long, Int) = aggregate((0L, 0L, 0)) { case (entryBuffer, _, result) =>
-    val dataLength = entryBuffer.getInt(offset.DATA_LENGTH)
-    (result._1 + 1, result._2 + dataLength, math.max(result._3, dataLength))
+  private def inspect():(Long, Long, Int) = {
+    var entryCount = 0L
+    var totalDataLength = 0L
+    var maxDataLength = 0
+    foreach { case (entryBuffer, _) =>
+      val dataLength = entryBuffer.getInt(offset.DATA_LENGTH)
+      entryCount += 1
+      totalDataLength += dataLength
+      maxDataLength = math.max(maxDataLength, dataLength)
+    }
+    (entryCount, totalDataLength, maxDataLength)
   }
 
   /**
@@ -390,7 +421,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
       val newEntryOffset = entryTailOffset - JournaledFile.ENTRY_SIZE - dataLength
       if(entryOffset + JournaledFile.ENTRY_SIZE + dataLength > newEntryOffset) {
         throw new IllegalArgumentException(
-          f"new entry region is overlapped; space-out size $size%,d must be larger than entry size ${JournaledFile.ENTRY_SIZE+dataLength}%,d bytes")
+          f"new entry region is overlapped; space-out size $size%,d must be larger than entry size ${JournaledFile.ENTRY_SIZE + dataLength}%,d bytes")
       }
 
       // データの移動
@@ -437,6 +468,15 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
   }
 
   /**
+    * このジャーナルに含まれている全てのエントリに対して繰り返し処理を行います。
+    *
+    * @param f 各エントリに対して適用する関数 (エントリ, エントリのオフセット)
+    */
+  private def foreach(f:(ByteBuffer, Long) => Unit):Unit = aggregate(()) { case (entryBuffer, entryOffset, _) =>
+    f(entryBuffer, entryOffset)
+  }
+
+  /**
     * このファイルが Quebic Journal ファイルフォーマットであることを確認します。フォーマットが不正な場合は例外が発生し
     * ます。
     *
@@ -465,6 +505,48 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     if(schema.types.length != existing.types.length || !schema.types.zip(existing.types).forall(x => x._1.id == x._2.id)) {
       throw new FormatException(s"incompatible schema: actual $schema != expected $existing")
     }
+  }
+
+  def dump():String = {
+    val sw = new StringWriter()
+    val pw = new PrintWriter(sw)
+    pw.println(toString)
+    val df = new SimpleDateFormat("yyyyMMddHHmmss.SSS")
+    var entryCount = 0L
+    var totalDataLength = 0L
+    var maxDataLength = 0
+    foreach { case (entryBuffer, entryOffset) =>
+      val entrySignature = entryBuffer.get(offset.ENTRY_SIG)
+      val previous = entryBuffer.getLong(offset.PREVIOUS)
+      val createdAt = df.format(entryBuffer.getLong(offset.CREATED_AT))
+      val expiresAt = entryBuffer.getLong(offset.EXPIRES_AT)
+      val expiresAtStr = if(expiresAt <= 0) "" else " " + df.format(entryBuffer.getLong(offset.EXPIRES_AT)) + " expr, "
+      val errors = entryBuffer.getShort(offset.ERRORS) & 0xFFFF
+      val dataLength = entryBuffer.getInt(offset.DATA_LENGTH)
+      val compression = CompressionType.valueOf(entryBuffer.get(offset.COMPRESSION))
+      pw.println(f"  0x$entrySignature%02X 0x$entryOffset%08X, next 0x$previous%08X, $createdAt add, $expiresAtStr$errors%,d err, $dataLength%,dB data, ${compression.name} compressed")
+      entryCount += 1
+      totalDataLength += dataLength
+      maxDataLength = math.max(maxDataLength, dataLength)
+    }
+    pw.println(f"$entryCount%,d entries, total $totalDataLength%,dB data, max $maxDataLength%,dB data")
+    pw.flush()
+    sw.toString
+  }
+
+  override def toString:String = if(file.length() > 0) {
+    val headerBuffer = ByteBuffer.allocate(header.size)
+    fc.read(headerBuffer, offset.MAGIC_NUMBER)
+    headerBuffer.flip()
+    val magicNumber = headerBuffer.getShort(offset.MAGIC_NUMBER) & 0xFFFF
+    val headerSize = headerBuffer.getShort(offset.HEADER_SIZE) & 0xFFFF
+    val currentItems = headerBuffer.getLong(offset.CURRENT_ITEMS)
+    val lastPosition = headerBuffer.getLong(offset.LAST_POSITION)
+    headerBuffer.position(offset.SCHEMA)
+    val schema = Schema(headerBuffer)
+    f"$schema 0x$magicNumber%04X $headerSize%,dB $currentItems%,d items, 0x$lastPosition%X"
+  } else {
+    f"$schema 0x${JournaledFile.MagicNumber}%04X ${header.size}%,dB ${0}%,d items, 0x${header.size}%X"
   }
 
   override def close():Unit = {

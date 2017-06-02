@@ -1,6 +1,7 @@
 package io.quebic
 
-import java.io.File
+import java.io.{File, IOException}
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.{Timer, TimerTask}
 
 import io.quebic.Queue.{Value2Struct, logger, using}
@@ -13,7 +14,13 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
     throw new IllegalArgumentException(f"queue capacity must be larger than zero: $capacity%,d")
   }
 
-  private[this] val journalFile = new File(file.getAbsoluteFile.getParent, file.getName + ".qbj")
+  /** ジャーナルファイル */
+  private[this] val journalFile = {
+    val name = file.getName
+    val ext = name.lastIndexOf('.')
+    val base = if(ext >= 0) name.substring(0, ext) else name
+    new File(file.getAbsoluteFile.getParent, s"$base.qbj")
+  }
 
   private[this] val migrateTask = new TimerTask {
     override def run():Unit = try {
@@ -26,6 +33,8 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
 
   timer.scheduleAtFixedRate(migrateTask, 1000, 1000)
 
+  private[this] val closed = new AtomicBoolean(false)
+
   // TODO 同一 JVM 上での FileChannel.lock() は例外が発生するため何かしらファイルに対する synchronized が必要
 
   private[this] def both[R](f:(JournaledFile, JournaledFile) => R):R = journal { in =>
@@ -34,20 +43,39 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
     }
   }
 
-  private[this] def journal[R](f:(JournaledFile) => R):R = journalFile.synchronized {
-    using(new JournaledFile(journalFile, conv.schema)) { file =>
-      f(file)
+  private[this] def on[R](file:File)(f:(JournaledFile) => R):R = file.synchronized {
+    using(new JournaledFile(file, conv.schema)) { journal =>
+      f(journal)
     }
   }
 
-  private[this] def queue[R](f:(JournaledFile) => R):R = file.synchronized {
-    using(new JournaledFile(file, conv.schema)) { file =>
-      f(file)
-    }
+  private[this] def journal[R](f:(JournaledFile) => R):R = if(closed.get) {
+    throw new IOException(s"queue closed: $file")
+  } else on(journalFile) { file =>
+    f(file)
   }
 
-  private[this] def migrate():Unit = if(journalFile.length() > 0) {
-    both(_ migrateTo _)
+  private[this] def queue[R](f:(JournaledFile) => R):R = if(closed.get) {
+    throw new IOException(s"queue closed: $file")
+  } else on(file) { file =>
+    f(file)
+  }
+
+  /**
+    * バッチマイグレーションの実行。このメソッドはキューがクローズされた後にマイグレーションを行うため `closed` フラグを
+    * 無視する。
+    */
+  private[this] def migrate():Unit = {
+    if(journalFile.length() > 0) {
+      on(journalFile) { in =>
+        on(file){ out =>
+          in.migrateTo(out)
+        }
+      }
+    }
+    if(closed.get() && journalFile.exists()) {
+      journalFile.delete()
+    }
   }
 
   /**
@@ -55,9 +83,9 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
     *
     * @return キューのデータ数
     */
-  def size:Long = if(journalFile.length() > 0) {
-    both { (a, b) => a.size + b.size }
-  } else if(file.length() > 0) queue(_.size) else 0
+  def size:Long = if(journalFile.length() < 0){
+    queue(_.size)
+  } else both { (a, b) => a.size + b.size }
 
   /**
     * このキューが使用しているディスクスペースを参照します。
@@ -69,7 +97,7 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
   /**
     * このキューが使用しているリソースを解放します。キューから取り出されていないデータはファイルに永続化されています。
     */
-  def close():Unit = {
+  def close():Unit = if(closed.compareAndSet(false, true)) {
     migrateTask.cancel()
     migrateTask.run()
   }
