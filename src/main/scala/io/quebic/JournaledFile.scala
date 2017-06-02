@@ -16,7 +16,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
   private val fc = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
   private[this] val lock = fc.lock()
 
-  private[this] val schemaBinary = schema.toByteArray
+  private[this] lazy val schemaBinary = schema.toByteArray
 
   locally {
     if(fc.size() == 0) {
@@ -29,6 +29,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
   private object raw {
     private[this] val longBuffer = ByteBuffer.allocate(java.lang.Long.BYTES)
 
+    /** ファイルの指定されたオフセットから Long 値を読み込みます。 */
     def readLong(offset:Long):Long = {
       longBuffer.clear()
       fc.read(longBuffer, offset)
@@ -36,6 +37,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
       longBuffer.getLong
     }
 
+    /** ファイルの指定されたオフセットに Long 値を書き込みます。 */
     def writeLong(offset:Long, value:Long):Unit = {
       longBuffer.clear()
       longBuffer.putLong(value)
@@ -45,6 +47,8 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
   }
 
   private object header {
+
+    /** このジャーナルのヘッダサイズを参照します。 */
     val size:Int = offset.SCHEMA + schemaBinary.length
 
     def currentItems:Long = raw.readLong(offset.CURRENT_ITEMS)
@@ -75,10 +79,10 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     val correctSize = if(size == 0 && fileSize > header.size) {
       val (entryCount, _, _) = inspect()
       entryCount
-    } else if(fileSize == header.size && size > 0){
+    } else if(fileSize == header.size && size > 0) {
       0L
     } else size
-    if(correctSize != size){
+    if(correctSize != size) {
       logger.debug(f"correcting the number of items: $size%,d -> $correctSize%,d")
       header.currentItems = correctSize
     }
@@ -155,6 +159,16 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     }
   }
 
+  /**
+    * このジャーナルの最も新しく追加されたデータを参照し `f` に渡します。`f` が正常に終了した場合、そのデータはジャーナル
+    * から取り除かれます。`f` で例外が発生した場合、そのデータにはエラーが加算され、必要に応じて廃棄されます。
+    *
+    * @param maxRetry データに対するエラーの許容回数
+    * @param f        データに対して適用する処理
+    * @tparam T 処理結果の型
+    * @return 処理時のエラーは `Left[Throwable]`、取り出すデータが存在しない場合 `Right(None)`、データが存在し処理が
+    *         正常に終了した場合 `Right(Some(result))`
+    */
   @tailrec
   private[this] def consumeEntryWithData[T](maxRetry:Short)(f:(ByteBuffer, ByteBuffer) => T):Either[Throwable, Option[T]] = {
 
@@ -336,14 +350,10 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     if(entryCount > 0) {
       val t0 = System.currentTimeMillis()
 
-      this.verify()
-      queue.verify()
-
       val minimumSize = totalDataLength + entryCount * JournaledFile.ENTRY_SIZE
       val (_, _, maxDataLength) = queue.inspect()
       val spaceOutSize = math.max(maxDataLength + JournaledFile.ENTRY_SIZE, minimumSize)
       val deepestEntryOffset = queue.spaceOut(spaceOutSize)
-      queue.verify()
 
       // このジャーナルの要素をキューへ移動
       val (dstLastNewEntryOffset, _) = aggregate((-1L, queue.header.size.toLong)) { case (entryBuffer, srcEntryOffset, (dstPrevEntryOffset, dstRegionOffset)) =>
@@ -353,7 +363,6 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
         val dstEntryOffset = queue.writeDataWithEntry(dstRegionOffset, dataBuffer, entryBuffer)
         (dstEntryOffset, dstRegionOffset + JournaledFile.ENTRY_SIZE + dataLength)
       }
-      queue.verify()
 
       // メタ情報を更新して新しいエントリを連結
       if(deepestEntryOffset >= 0) {
@@ -366,7 +375,6 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
       // このジャーナルの内容を破棄
       fc.truncate(0) // ファイルオープン中に delete() できないケースを想定して 0 バイトに削除
       file.delete()
-      queue.verify()
 
       if(logger.isDebugEnabled) {
         val t = System.currentTimeMillis() - t0

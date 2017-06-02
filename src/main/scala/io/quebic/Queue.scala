@@ -22,6 +22,20 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
     new File(file.getAbsoluteFile.getParent, s"$base.qbj")
   }
 
+  /**
+    * 同一 JVM 内で同じジャーナルファイルにアクセスしないための synchronized 用オブジェクト。`FileChannel.lock()` が同一
+    * JVM 上でのロックを OverlappingFileLockException とするため。
+    */
+  private[this] val journalFileLock = journalFile.getCanonicalPath.intern()
+
+  /**
+    * 同一 JVM 内で同じキューファイルにアクセスしないための synchronized 用オブジェクト。
+    */
+  private[this] val queueFileLock = file.getCanonicalPath.intern()
+
+  /**
+    * ジャーナルからキューへ定期マイグレーションを行うためのタスク。
+    */
   private[this] val migrateTask = new TimerTask {
     override def run():Unit = try {
       migrate()
@@ -35,15 +49,13 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
 
   private[this] val closed = new AtomicBoolean(false)
 
-  // TODO 同一 JVM 上での FileChannel.lock() は例外が発生するため何かしらファイルに対する synchronized が必要
-
   private[this] def both[R](f:(JournaledFile, JournaledFile) => R):R = journal { in =>
     queue { out =>
       f(in, out)
     }
   }
 
-  private[this] def on[R](file:File)(f:(JournaledFile) => R):R = file.synchronized {
+  private[this] def on[R](file:File, lock:Object)(f:(JournaledFile) => R):R = lock.synchronized {
     using(new JournaledFile(file, conv.schema)) { journal =>
       f(journal)
     }
@@ -51,13 +63,13 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
 
   private[this] def journal[R](f:(JournaledFile) => R):R = if(closed.get) {
     throw new IOException(s"queue closed: $file")
-  } else on(journalFile) { file =>
+  } else on(journalFile, journalFileLock) { file =>
     f(file)
   }
 
   private[this] def queue[R](f:(JournaledFile) => R):R = if(closed.get) {
     throw new IOException(s"queue closed: $file")
-  } else on(file) { file =>
+  } else on(file, queueFileLock) { file =>
     f(file)
   }
 
@@ -66,9 +78,10 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
     * 無視する。
     */
   private[this] def migrate():Unit = {
+    // 重要: デッドロック回避のためマイグレーション時のロック順は queue → journal にすること。
     if(journalFile.length() > 0) {
-      on(journalFile) { in =>
-        on(file){ out =>
+      on(file, queueFileLock){ out =>
+        on(journalFile, journalFileLock) { in =>
           in.migrateTo(out)
         }
       }
@@ -178,9 +191,8 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
       } else if(journalFile.length() <= 0) {
         None
       } else {
-        journal { j =>
-          j.migrateTo(q)
-        }
+        // 重要: デッドロック回避のためマイグレーション時のロック順は queue → journal にすること。
+        journal(_.migrateTo(q))
         if(q.size > 0) q.pop(0).map(conv.to) else None
       }
     }
