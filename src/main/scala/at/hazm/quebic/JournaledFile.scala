@@ -1,19 +1,38 @@
-package io.quebic
+package at.hazm.quebic
 
 import java.io.{File, PrintWriter, StringWriter}
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
-import java.nio.file.StandardOpenOption
+import java.nio.file.{AccessDeniedException, StandardOpenOption}
 import java.text.SimpleDateFormat
 
-import io.quebic.JournaledFile.{logger, offset}
+import JournaledFile.{logger, offset}
 import org.slf4j.LoggerFactory
 
 import scala.annotation.tailrec
 
 private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoCloseable {
   private[this] val path = file.toPath
-  private val fc = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
+
+  /**
+    * このジャーナルのファイルチャネル。実行環境によってまれに AccessDeniedException が発生するためリトライを追加している。
+    */
+  private val fc = {
+    @tailrec
+    def _open(retry:Int):FileChannel = try {
+      FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
+    } catch {
+      case ex:AccessDeniedException =>
+        if(retry >= 10) throw ex else {
+          logger.warn(s"access denied: $path, retrying...")
+          Thread.sleep(20 * (2 << math.min(retry, 10))) // truncated binary exponential back-off
+          _open(retry + 1)
+        }
+    }
+
+    _open(0)
+  }
+
   private[this] val lock = fc.lock()
 
   private[this] lazy val schemaBinary = schema.toByteArray
@@ -75,11 +94,11 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     */
   def size:Long = {
     val size = header.currentItems
-    val fileSize = fc.size()
-    val correctSize = if(size == 0 && fileSize > header.size) {
+    val lastPosition = header.lastPosition
+    val correctSize = if(size == 0 && lastPosition >= 0) {
       val (entryCount, _, _) = inspect()
       entryCount
-    } else if(fileSize == header.size && size > 0) {
+    } else if(lastPosition < 0 && size > 0) {
       0L
     } else size
     if(correctSize != size) {
@@ -99,20 +118,57 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     * @param lifetime    データの有効期限を示す現在時刻からの相対時間 (ミリ秒)。負の値を指定した場合は有効期限なし
     * @param compression データの圧縮方法
     */
-  def push(values:Struct, lifetime:Long = -1, compression:CompressionType = CompressionType.NONE):Unit = {
+  def push(values:Struct, lifetime:Long = -1, compression:Codec = Codec.PLAIN):Unit = {
 
     // 現在のエントリ数を取得
     val currentItems = header.currentItems
 
     // データとエントリの書き込み
-    val serializedValues = schema.serialize(values, compression)
+    val dataBuffer = schema.serialize(values, compression)
     val previous = header.lastPosition
-    val regionOffset = fc.size()
-    val entryOffset = writeDataWithEntry(regionOffset, serializedValues, previous, lifetime, compression.id)
+    val regionOffset = if(previous >= 0) {
+      val entryBuffer = ByteBuffer.allocate(JournaledFile.ENTRY_SIZE)
+      readEntry(previous, entryBuffer)
+      previous + JournaledFile.ENTRY_SIZE + entryBuffer.getInt(offset.DATA_LENGTH)
+    } else header.size
+    val entryOffset = writeDataWithEntry(regionOffset, dataBuffer, previous, lifetime, compression.id)
 
     // ヘッダの更新
     header.currentItems = currentItems + 1
     header.lastPosition = entryOffset
+  }
+
+  /**
+    * このジャーナルの最も浅い位置 (右側) に存在するデータをジャーナルから削除することなく参照します。
+    *
+    * @return 最も浅い位置のデータ
+    */
+  def peek:Option[Struct] = {
+    val entryOffset = header.lastPosition
+    if(entryOffset < 0) None else Some(peekStruct(entryOffset))
+  }
+
+  /**
+    * このジャーナルの最も深い位置 (左側) に存在する (していた) データをジャーナルから削除することなく参照します。
+    * ジャーナルが空の場合でもデータは残っています。
+    * このデータはジャーナルがスタックの場合に最も古いデータ、キューの場合に最も新しいデータを表します。
+    *
+    * @return 最も深い位置のデータ
+    */
+  def peekDeepest:Option[Struct] = if(fc.size() <= header.size) None else Some(peekStruct(header.size))
+
+  /**
+    * このジャーナルの最も深い位置に存在する (していた) データをジャーナルから削除することなく参照します。このデータはジャーナルが
+    * スタックの場合に最も古いデータ、キューの場合に最も新しいデータを表します。
+    *
+    * @return 最も深い位置のデータ
+    */
+  private[this] def peekStruct(entryOffset:Long):Struct = {
+    val entryBuffer = ByteBuffer.allocate(JournaledFile.ENTRY_SIZE)
+    readEntry(entryOffset, entryBuffer)
+    val dataLength = entryBuffer.getInt(offset.DATA_LENGTH)
+    val dataBuffer = readData(entryOffset, dataLength)
+    schema.deserialize(dataBuffer, Codec.valueOf(entryBuffer.get(offset.COMPRESSION)))
   }
 
   /**
@@ -148,7 +204,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
   def consume[T](errorPermitCount:Short = 3)(f:(Struct) => T):Either[Throwable, Option[T]] = {
     consumeEntryWithData(errorPermitCount) { case (entryBuffer, dataBuffer) =>
       val data = try {
-        schema.deserialize(dataBuffer)
+        schema.deserialize(dataBuffer, Codec.valueOf(entryBuffer.get(offset.COMPRESSION)))
       } catch {
         case ex:Exception =>
           val ent = JournaledFile.dumpEntry(entryBuffer)
@@ -212,7 +268,10 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
         val previousEntryOffset = entryBuffer.getLong(offset.PREVIOUS)
         header.currentItems = if(previousEntryOffset < 0) 0 else header.currentItems = header.currentItems - 1
         header.lastPosition = previousEntryOffset
-        fc.truncate(entryOffset)
+        // 最後に投入したデータを参照するために一番深いエントリは保全する
+        if(entryOffset > header.size) {
+          fc.truncate(entryOffset)
+        }
         result
       } else {
         // 失敗している場合はエントリを更新
@@ -349,6 +408,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
     val (entryCount, totalDataLength, _) = inspect()
     if(entryCount > 0) {
       val t0 = System.currentTimeMillis()
+      val queueInspect = queue.inspect()
 
       val minimumSize = totalDataLength + entryCount * JournaledFile.ENTRY_SIZE
       val (_, _, maxDataLength) = queue.inspect()
@@ -373,8 +433,16 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
       queue.header.currentItems = queue.header.currentItems + entryCount
 
       // このジャーナルの内容を破棄
-      fc.truncate(0) // ファイルオープン中に delete() できないケースを想定して 0 バイトに削除
+      fc.truncate(0) // ファイルオープン中に delete() できないケースを想定して 0 バイトに設定
       file.delete()
+
+      val newInspect = queue.inspect()
+      if(newInspect._1 != entryCount + queueInspect._1) {
+        throw new IllegalStateException(s"migration failed! conflict entry count: $entryCount + ${queueInspect._1} -> ${newInspect._1}")
+      }
+      if(newInspect._2 != totalDataLength + queueInspect._2) {
+        throw new IllegalStateException(s"migration failed! conflict data size: $totalDataLength + ${queueInspect._2} -> ${newInspect._2}")
+      }
 
       if(logger.isDebugEnabled) {
         val t = System.currentTimeMillis() - t0
@@ -531,7 +599,7 @@ private[quebic] class JournaledFile(file:File, schema:Schema) extends AutoClosea
       val expiresAtStr = if(expiresAt <= 0) "" else " " + df.format(entryBuffer.getLong(offset.EXPIRES_AT)) + " expr, "
       val errors = entryBuffer.getShort(offset.ERRORS) & 0xFFFF
       val dataLength = entryBuffer.getInt(offset.DATA_LENGTH)
-      val compression = CompressionType.valueOf(entryBuffer.get(offset.COMPRESSION))
+      val compression = Codec.valueOf(entryBuffer.get(offset.COMPRESSION))
       pw.println(f"  0x$entrySignature%02X 0x$entryOffset%08X, next 0x$previous%08X, $createdAt add, $expiresAtStr$errors%,d err, $dataLength%,dB data, ${compression.name} compressed")
       entryCount += 1
       totalDataLength += dataLength

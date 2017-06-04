@@ -1,4 +1,4 @@
-package io.quebic
+package at.hazm.quebic
 
 object Limits {
 

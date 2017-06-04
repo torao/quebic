@@ -1,17 +1,30 @@
-package io.quebic
+package at.hazm.quebic
 
 import java.io.{File, IOException}
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.{Timer, TimerTask}
 
-import io.quebic.Queue.{Value2Struct, logger, using}
+import Queue.{Value2Struct, logger, using}
 import org.slf4j.LoggerFactory
 
 import scala.annotation.tailrec
 
+/**
+  * スレッドやプロセス間で共有できるローカルファイルを使用したキューです。JavaVM ヒープを使用する Java/Scala 標準のコレクション API
+  * より多数で大きなサイズのデータを扱うことができます。
+  *
+  * キューはスキーマ (タプル形式のデータ型) を定義できます。このスキーマを使用してキューの投入側と取得側で安全にデータを変換することが
+  * できます。任意のユーザ定義データを透過的に扱うために構築時に `Struct` へのコンバーター実装である `Value2Struct` を指定します。
+  *
+  * @param file     キューに使用するファイル
+  * @param capacity キューの容量
+  * @param conv     任意のデータを [[Struct]] 型に変換するコンバーター
+  * @param timer    ジャーナルからキューへデータの移行処理を行うタイマー
+  * @tparam T このキューに投入または取り出す型
+  */
 class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Timer) extends AutoCloseable {
   if(capacity <= 0) {
-    throw new IllegalArgumentException(f"queue capacity must be larger than zero: $capacity%,d")
+    throw new IllegalArgumentException(f"queue capacity $capacity%,d must be larger than zero")
   }
 
   /** ジャーナルファイル */
@@ -49,6 +62,14 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
 
   private[this] val closed = new AtomicBoolean(false)
 
+  /**
+    * ジャーナルとキューの両方に対して処理を実行します。IMPORTANT: デッドロック回避のためマイグレーション時のロック順は journal → queue
+    * にすること。
+    *
+    * @param f ジャーナルとキューの両方に対して行う処理
+    * @tparam R 処理結果の型
+    * @return 処理結果
+    */
   private[this] def both[R](f:(JournaledFile, JournaledFile) => R):R = journal { in =>
     queue { out =>
       f(in, out)
@@ -78,16 +99,13 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
     * 無視する。
     */
   private[this] def migrate():Unit = {
-    // 重要: デッドロック回避のためマイグレーション時のロック順は queue → journal にすること。
+    // IMPORTANT: デッドロック回避のためマイグレーション時のロック順は journal → queue にすること。
     if(journalFile.length() > 0) {
-      on(file, queueFileLock){ out =>
-        on(journalFile, journalFileLock) { in =>
+      on(journalFile, journalFileLock) { in =>
+        on(file, queueFileLock) { out =>
           in.migrateTo(out)
         }
       }
-    }
-    if(closed.get() && journalFile.exists()) {
-      journalFile.delete()
     }
   }
 
@@ -96,7 +114,7 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
     *
     * @return キューのデータ数
     */
-  def size:Long = if(journalFile.length() < 0){
+  def size:Long = if(journalFile.length() < 0) {
     queue(_.size)
   } else both { (a, b) => a.size + b.size }
 
@@ -115,7 +133,22 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
     migrateTask.run()
   }
 
-  class Publisher(compression:CompressionType = CompressionType.NONE) {
+  /**
+    * このキューをストレージから削除します。キューがまだクローズしていない場合は暗黙的にクローズします。
+    * 他のスレッドまたはプロセスがキューを使用している場合は削除に失敗したり、またはデータ欠損が発生する可能性があります。
+    */
+  def dispose():Unit = {
+    close()
+    file.delete()
+    journalFile.delete()
+  }
+
+  /**
+    * このキューにデータを追加するためのインターフェースです。
+    *
+    * @param compression データ追加時の圧縮形式 (デフォルトは無圧縮)
+    */
+  class Publisher(compression:Codec = Codec.PLAIN) {
 
     /**
       * このキューへのデータ追加を試行します。キューの保持しているデータ数が `capacity` に達している場合、メソッドは直ちに false を
@@ -126,6 +159,7 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
       * @return データを追加できた場合 true
       */
     def tryPush(value:T, lifetime:Long = -1):Boolean = journal { j =>
+      // IMPORTANT: デッドロック回避のためマイグレーション時のロック順は journal → queue にすること。
       if(queue(_.size) + j.size >= capacity) false else {
         j.push(conv.from(value), lifetime, compression)
         true
@@ -165,6 +199,7 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
     def pushAll(values:Seq[T], limit:Long = -1, lifetime:Long = -1):Seq[T] = {
       @tailrec
       def _pushAll(t0:Long, values:Seq[T]):Seq[T] = {
+        // IMPORTANT: デッドロック回避のためマイグレーション時のロック順は journal → queue にすること。
         val remaining = journal { j =>
           val permitCount = math.min(queue(_.size) + j.size, values.length).toInt
           if(permitCount > 0) {
@@ -181,24 +216,55 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
 
       _pushAll(System.nanoTime(), values)
     }
+
+    /**
+      * このキューに追加された最も新しいデータを参照します。予期せぬ状況で終了した処理の再開時にキューへの投入がどこまで進んでいたかを
+      * 調べる目的で、キューが空となった場合でも直近の追加データはキュー内に保持されています。
+      *
+      * @return このキューに追加された最も新しいデータ
+      */
+    def latest:Option[T] = both { case (j, q) =>
+      (if(j.size > 0) j.peek else q.peekDeepest).map(conv.to)
+    }
   }
 
   class Subscriber() {
 
+    /**
+      * このキューからデータの取り出しを試行します。キュー内に有効なデータが存在した場合 `Some(data)` を返します。キューが空の場合は
+      * `None` を返します。このメソッドは呼び出し後直ちに終了します。
+      *
+      * @return キューから取り出したデータ、または `None`
+      */
     def tryPop():Option[T] = queue { q =>
       if(q.size > 0) {
         q.pop(0).map(conv.to)
-      } else if(journalFile.length() <= 0) {
+      } else None
+    }.orElse {
+      // ロック順を調整するためにいったんロックを外してマイグレーションを実行
+      if(journalFile.length() <= 0) {
         None
-      } else {
-        // 重要: デッドロック回避のためマイグレーション時のロック順は queue → journal にすること。
-        journal(_.migrateTo(q))
+      } else both { case (j, q) =>
+        j.migrateTo(q)
         if(q.size > 0) q.pop(0).map(conv.to) else None
       }
     }
 
+    /**
+      * このキューからデータを取り出します。このメソッドは `pop(-1).get` と等価です。
+      *
+      * @return キューから取り出したデータ
+      */
     def pop():T = pop(-1).get
 
+    /**
+      * このキューからデータを取り出します。キューに有効なデータが存在しない場合 `limit` (ミリ秒) が経過するまでデータの到着を待機します。
+      * `limit` までにデータが到着した場合 `Some(result)` を返します。`limit` を超えてもデータが到着しなかった場合は `None` を
+      * 返します。`limit` に負の値を指定した場合は無制限となります。
+      *
+      * @param limit データが存在しなかった場合にデータ到着まで待機する時間 (ミリ秒)
+      * @return キューから取り出したデータ、または `None`
+      */
     def pop(limit:Long):Option[T] = {
       @tailrec
       def _pop(t0:Long):Option[T] = {

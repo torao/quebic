@@ -1,4 +1,4 @@
-package io.quebic
+package at.hazm.quebic
 
 trait Type {
   val id:Byte

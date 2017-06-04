@@ -10,7 +10,7 @@
     </layout>
   </appender>
 
-  <category name="io.quebic" additivity="false">
+  <category name="at.hazm.quebic" additivity="false">
     <level value="trace" />
     <appender-ref ref="stdout" />
   </category>
