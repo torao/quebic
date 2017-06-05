@@ -17,7 +17,7 @@ data and type to string: $dataToString
       Struct.TEXT((0 to 0xFF).map(_.toChar).toString()),
       Struct.BINARY((0 to 0xFF).map(_.toByte).toArray)
     ).map { data =>
-      data.typeName
+      data.dataType
       data.toString
       success
     }

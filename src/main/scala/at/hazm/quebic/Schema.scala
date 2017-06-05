@@ -35,8 +35,15 @@ case class Schema(types:DataType*) {
         Schema.writeBinary(bin, out)
       case (Struct.BINARY(value), DataType.BINARY) =>
         Schema.writeBinary(value, out)
+      case (Struct.VECTOR(values), DataType.VECTOR) =>
+        Schema.writeLong(values.length, out)
+        values.foreach{ value => out.writeDouble(value) }
+      case (Struct.TENSOR(shape, values), DataType.TENSOR) =>
+        Schema.writeLong(shape.length, out)
+        shape.foreach{ value => Schema.writeLong(value, out) }
+
       case (value, t) =>
-        throw new IncompatibleSchemaException(s"incompatible struct field type: expect ${t.name}, actual ${value.typeName} ($value)")
+        throw new IncompatibleSchemaException(s"incompatible struct field type: expect ${t.name}, actual ${value.dataType.name} ($value)")
     }
     out.close()
     ByteBuffer.wrap(codec.encode(baos.toByteArray))
@@ -64,6 +71,8 @@ case class Schema(types:DataType*) {
           Struct.TEXT(new String(Schema.readBinary(in), StandardCharsets.UTF_8))
         case DataType.BINARY =>
           Struct.BINARY(Schema.readBinary(in))
+        case DataType.VECTOR =>
+          Struct.VECTOR
       }:_*
     )
   }
@@ -74,10 +83,10 @@ case class Schema(types:DataType*) {
     * @return スキーマのバイナリ
     */
   def toByteArray:Array[Byte] = {
-    val paddingLength = Schema.bit2ToBit8AlignSize(types.length)
+    val paddingLength = Schema.bit4ToBit8AlignSize(types.length)
     (types.length.toByte +: types.map(_.id).padTo(paddingLength, 0.toByte).grouped(4).map { i =>
       i.indices.map{ j =>
-        (i(j) & 0x03) << (8 - ((j + 1) * 2))
+        (i(j) & DataType.BIT_MASK) << (8 - ((j + 1) * DataType.BIT_WIDTH))
       }.reduceLeft(_ | _).toByte
     }.toSeq).toArray
   }
@@ -97,16 +106,16 @@ object Schema {
     */
   def apply(buf:ByteBuffer):Schema = {
     val count = buf.get() & 0xFF
-    val byteSize = bit2ToBit8AlignSize(count) / 4
+    val byteSize = bit4ToBit8AlignSize(count) / DataType.NUM_IN_BYTE
     Schema((0 until byteSize).flatMap { _ =>
       val ts = buf.get() & 0xFF
-      (0 until 4).map { i =>
-        ((ts >> (8 - ((i + 1) * 2))) & 0x03).toByte
+      (0 until DataType.NUM_IN_BYTE).map { i =>
+        ((ts >> (8 - ((i + 1) * DataType.BIT_WIDTH))) & DataType.BIT_MASK).toByte
       }
     }.take(count).map(DataType.valueOf):_*)
   }
 
-  private[Schema] def bit2ToBit8AlignSize(len:Int):Int = len + (if(len % 4 == 0) 0 else 4 - len % 4)
+  private[Schema] def bit4ToBit8AlignSize(len:Int):Int = len + (if(len % DataType.NUM_IN_BYTE == 0) 0 else DataType.NUM_IN_BYTE - len % 2)
 
   private[Schema] def writeBinary(value:Array[Byte], out:DataOutputStream):Unit = {
     writeLong(value.length, out)

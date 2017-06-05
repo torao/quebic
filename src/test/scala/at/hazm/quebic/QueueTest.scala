@@ -18,6 +18,7 @@ initialized status: $initialState
 push and pop in single thread: $normalPushAndPopInSingleThread
 push and pop in multi threads: $multiThreadingPushAndPop
 GZIP compressed push and pop:  ${compression(Codec.GZIP)}
+latest data retrieve:          $leastDataRetrieve
 """
 
   def initialState:Result = {
@@ -154,6 +155,24 @@ GZIP compressed push and pop:  ${compression(Codec.GZIP)}
     elementAllPoped and poppedElementsAreAllRetrieved and poppedElementsAreAllEquals
   }
 
+  def leastDataRetrieve:Result = {
+    val file = File.createTempFile("test-", ".qbc", new File("."))
+    file.deleteOnExit()
+    val capacity = 10
+    val queue = new Queue[String](file, capacity, String2Struct, timer)
+    val publisher = new queue.Publisher(Codec.PLAIN)
+    val subscriber = new queue.Subscriber()
+    val sample = randomString(533, 1024)
+
+    val latestDataOfEmptyQueueIsNone = publisher.latest.isEmpty must beTrue
+    publisher.push(sample)
+    val pushDataSameAsLatestData = publisher.latest.get === sample
+    subscriber.pop()
+    val emptyQueueRememverLatestData = (queue.isEmpty must beTrue) and (publisher.latest.get === sample)
+
+    latestDataOfEmptyQueueIsNone and pushDataSameAsLatestData and emptyQueueRememverLatestData
+  }
+
   object String2Struct extends Value2Struct[String] {
     override def schema:Schema = Schema(DataType.TEXT)
 
@@ -174,6 +193,7 @@ GZIP compressed push and pop:  ${compression(Codec.GZIP)}
     def times(f: => Unit):Unit = range.foreach(_ => f)
 
     def fill[T](f: => T):Iterable[T] = range.map(_ => f)
+
     def range:Iterable[Int] = 0 until num
   }
 

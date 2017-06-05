@@ -119,6 +119,13 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
   } else both { (a, b) => a.size + b.size }
 
   /**
+    * このキューが空であるかを判定します。
+    *
+    * @return キューが空の場合 true
+    */
+  def isEmpty:Boolean = size == 0
+
+  /**
     * このキューが使用しているディスクスペースを参照します。
     *
     * @return ディスクスペース (バイト)
@@ -185,6 +192,17 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
       }
 
       _push(System.nanoTime())
+    }
+
+    /**
+      * 直前に push されたデータと新しいデータ `value` を評価し、新しいデータ `value` を push するかを判断するメソッドです。
+      * このキューに追加された最も新しいデータを参照します。予期せぬ状況で終了した処理の再開時にキューへの投入がどこまで進んでいたかを
+      * 調べる目的で、キューが空となった場合でも直近の追加データはキュー内に保持されています。
+      *
+      * @return このキューに追加された最も新しいデータ
+      */
+    def compareAndPush(value:T, comparator:(T,T)=>Boolean, lifetime:Long = -1):Boolean = {
+
     }
 
     /**
