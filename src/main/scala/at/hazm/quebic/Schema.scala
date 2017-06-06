@@ -2,11 +2,10 @@ package at.hazm.quebic
 
 import java.io._
 import java.nio.ByteBuffer
-import java.nio.charset.StandardCharsets
 
 import org.slf4j.LoggerFactory
 
-case class Schema(types:DataType*) {
+case class Schema(types:DataType[_]*) {
   if(types.length > Limits.MaxColumnSize) {
     throw new FormatException(f"too many schema types: ${types.length},d > ${Limits.MaxColumnSize},d")
   }
@@ -26,22 +25,7 @@ case class Schema(types:DataType*) {
     val baos = new ByteArrayOutputStream()
     val out = new DataOutputStream(baos)
     struct.values.zip(types).foreach {
-      case (Struct.INTEGER(value), DataType.INTEGER) =>
-        Schema.writeLong(value, out)
-      case (Struct.REAL(value), DataType.REAL) =>
-        out.writeDouble(value)
-      case (Struct.TEXT(value), DataType.TEXT) =>
-        val bin = value.getBytes(StandardCharsets.UTF_8)
-        Schema.writeBinary(bin, out)
-      case (Struct.BINARY(value), DataType.BINARY) =>
-        Schema.writeBinary(value, out)
-      case (Struct.VECTOR(values), DataType.VECTOR) =>
-        Schema.writeLong(values.length, out)
-        values.foreach{ value => out.writeDouble(value) }
-      case (Struct.TENSOR(shape, values), DataType.TENSOR) =>
-        Schema.writeLong(shape.length, out)
-        shape.foreach{ value => Schema.writeLong(value, out) }
-
+      case (data, dataType) if data.dataType == dataType => data.writeTo(out)
       case (value, t) =>
         throw new IncompatibleSchemaException(s"incompatible struct field type: expect ${t.name}, actual ${value.dataType.name} ($value)")
     }
@@ -63,16 +47,13 @@ case class Schema(types:DataType*) {
 
     Struct(
       types.map {
-        case DataType.INTEGER =>
-          Struct.INTEGER(Schema.readLong(in))
-        case DataType.REAL =>
-          Struct.REAL(in.readDouble())
-        case DataType.TEXT =>
-          Struct.TEXT(new String(Schema.readBinary(in), StandardCharsets.UTF_8))
-        case DataType.BINARY =>
-          Struct.BINARY(Schema.readBinary(in))
-        case DataType.VECTOR =>
-          Struct.VECTOR
+        case DataType.INTEGER => Struct.INTEGER(DataType.INTEGER.read(in))
+        case DataType.REAL => Struct.REAL(DataType.REAL.read(in))
+        case DataType.TEXT => Struct.TEXT(DataType.TEXT.read(in))
+        case DataType.BINARY => Struct.BINARY(DataType.BINARY.read(in))
+        case DataType.TENSOR =>
+          val (shape, values) = DataType.TENSOR.read(in)
+          Struct.TENSOR(shape, values)
       }:_*
     )
   }
@@ -84,8 +65,8 @@ case class Schema(types:DataType*) {
     */
   def toByteArray:Array[Byte] = {
     val paddingLength = Schema.bit4ToBit8AlignSize(types.length)
-    (types.length.toByte +: types.map(_.id).padTo(paddingLength, 0.toByte).grouped(4).map { i =>
-      i.indices.map{ j =>
+    (types.length.toByte +: types.map(_.id).padTo(paddingLength, 0.toByte).grouped(DataType.NUM_IN_BYTE).map { i =>
+      i.indices.map { j =>
         (i(j) & DataType.BIT_MASK) << (8 - ((j + 1) * DataType.BIT_WIDTH))
       }.reduceLeft(_ | _).toByte
     }.toSeq).toArray
@@ -116,45 +97,5 @@ object Schema {
   }
 
   private[Schema] def bit4ToBit8AlignSize(len:Int):Int = len + (if(len % DataType.NUM_IN_BYTE == 0) 0 else DataType.NUM_IN_BYTE - len % 2)
-
-  private[Schema] def writeBinary(value:Array[Byte], out:DataOutputStream):Unit = {
-    writeLong(value.length, out)
-    out.write(value)
-  }
-
-  private[Schema] def readBinary(in:DataInputStream):Array[Byte] = {
-    val size = readLong(in).toInt
-    val binary = new Array[Byte](size)
-    in.readFully(binary)
-    binary
-  }
-
-  private[Schema] def writeLong(value:Long, out:DataOutputStream):Unit = if(value >= 0) {
-    // bitcoin 方式
-    // 0～252 なら整数そのもの、253 なら続く 2 バイトに値が入っている、254 なら続く 4 バイトに値が入っている、255 なら続く 8 バイトに値が入っている
-    value match {
-      case b if b <= 252 =>
-        out.write(b.toByte)
-      case s if s <= 0xFFFF =>
-        out.write(253.toByte)
-        out.writeShort(s.toShort)
-      case i if i <= 0xFFFFFFFFL =>
-        out.write(254.toByte)
-        out.writeInt(i.toInt)
-      case l =>
-        out.write(255.toByte)
-        out.writeLong(l)
-    }
-  } else {
-    out.write(255.toByte)
-    out.writeLong(value)
-  }
-
-  private[Schema] def readLong(in:DataInputStream):Long = in.readByte() & 0xFF match {
-    case b if b <= 252 => b
-    case s if s == 253 => in.readShort() & 0xFFFF
-    case i if i == 254 => in.readInt() & 0xFFFFFFFFL
-    case _ => in.readLong()
-  }
 
 }

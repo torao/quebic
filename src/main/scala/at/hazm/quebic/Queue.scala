@@ -4,7 +4,7 @@ import java.io.{File, IOException}
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.{Timer, TimerTask}
 
-import Queue.{Value2Struct, logger, using}
+import at.hazm.quebic.Queue.{Value2Struct, logger, using}
 import org.slf4j.LoggerFactory
 
 import scala.annotation.tailrec
@@ -192,17 +192,6 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
       }
 
       _push(System.nanoTime())
-    }
-
-    /**
-      * 直前に push されたデータと新しいデータ `value` を評価し、新しいデータ `value` を push するかを判断するメソッドです。
-      * このキューに追加された最も新しいデータを参照します。予期せぬ状況で終了した処理の再開時にキューへの投入がどこまで進んでいたかを
-      * 調べる目的で、キューが空となった場合でも直近の追加データはキュー内に保持されています。
-      *
-      * @return このキューに追加された最も新しいデータ
-      */
-    def compareAndPush(value:T, comparator:(T,T)=>Boolean, lifetime:Long = -1):Boolean = {
-
     }
 
     /**
