@@ -45,11 +45,11 @@ latest data retrieve:          $leastDataRetrieve
     val t0 = System.currentTimeMillis()
     expected.foreach { s => publish.push(s) }
     val t1 = System.currentTimeMillis()
-    System.out.println(f"${expected.length} pushed queue size: ${queue.diskSpace}%,dB [${t1 - t0}%,dms]")
+    System.out.println(f"${expected.length} pushed queue size: ${queue.diskSpace}%,dB [${t1 - t0}%,dms] ${(t1-t0)/expected.length.toDouble}%,.1f[ms/item]")
     val pushedSizeEqualsItemCount = queue.size === expected.length
     val actual = expected.indices.map { _ => subscribe.pop() }
     val t2 = System.currentTimeMillis()
-    System.out.println(f"${actual.length} popped queue size: ${queue.diskSpace}%,dB [${t2 - t1}%,dms]")
+    System.out.println(f"${actual.length} popped queue size: ${queue.diskSpace}%,dB [${t2 - t1}%,dms] ${(t2-t1)/actual.length.toDouble}%,.1f[ms/item]")
     val elementAllPoped = queue.size === 0
     val poppedElementsAreAllRetrieved = actual.length === expected.length
     val poppedElementsAreAllEquals = actual.zip(expected).map(x => x._1 === x._2).reduceLeft(_ and _)
@@ -82,7 +82,8 @@ latest data retrieve:          $leastDataRetrieve
       val subscribe = new queue.Subscriber()
       val t0 = System.currentTimeMillis()
       val data = (expected.length * pushThreadSize / popThreadSize).fill(subscribe.pop(5 * 1000L)).flatten.toList
-      System.out.println(f"  POP: ${expected.length}%,d, ${System.currentTimeMillis() - t0}%,d[ms]")
+      val t1 = System.currentTimeMillis()
+      System.out.println(f"  POP: ${expected.length}%,d, ${t1 - t0}%,d[ms] ${(t1-t0)/expected.length.toDouble}%,.1f[ms/item]")
       actual.synchronized(actual.appendAll(data))
       queue.close()
     }
@@ -96,7 +97,8 @@ latest data retrieve:          $leastDataRetrieve
       val publish = new queue.Publisher()
       val t0 = System.currentTimeMillis()
       expected.foreach(s => publish.push(s))
-      System.out.println(f"  PUSH: ${expected.length}%,d, ${System.currentTimeMillis() - t0}%,d[ms]")
+      val t1 = System.currentTimeMillis()
+      System.out.println(f"  PUSH: ${expected.length}%,d, ${t1 - t0}%,d[ms] ${(t1-t0)/expected.length.toDouble}%,.1f[ms/item]")
       queue.close()
     }
 
@@ -141,11 +143,11 @@ latest data retrieve:          $leastDataRetrieve
     val t0 = System.currentTimeMillis()
     expected.foreach { s => publish.push(s) }
     val t1 = System.currentTimeMillis()
-    System.out.println(f"${compress.name}: ${expected.length} pushed queue size: ${queue.diskSpace}%,dB [${t1 - t0}%,dms]")
+    System.out.println(f"${compress.name}: ${expected.length} pushed queue size: ${queue.diskSpace}%,dB [${t1 - t0}%,dms] ${(t1-t0)/expected.length.toDouble}%,.1f[ms/item]")
 
     val actual = expected.indices.map { _ => subscribe.pop() }
     val t2 = System.currentTimeMillis()
-    System.out.println(f"${compress.name}: ${actual.length} popped queue size: ${queue.diskSpace}%,dB [${t2 - t1}%,dms]")
+    System.out.println(f"${compress.name}: ${actual.length} popped queue size: ${queue.diskSpace}%,dB [${t2 - t1}%,dms] ${(t2-t1)/actual.length.toDouble}%,.1f[ms/item]")
 
     val elementAllPoped = queue.size === 0
     val poppedElementsAreAllRetrieved = actual.length === expected.length
