@@ -82,3 +82,5 @@ In single thread, push - migration - pop sequential operation for 1kB binary ite
 ## Internal Implementation
 
 Quebic is based on double-stack queue.
+
+![double-stack queue](doc/double-stack_queue.png)
