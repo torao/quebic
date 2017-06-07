@@ -81,6 +81,12 @@ In single thread, push - migration - pop sequential operation for 1kB binary ite
 
 ## Internal Implementation
 
+### double-stack queue
+
 Quebic is based on double-stack queue.
 
 ![double-stack queue](doc/double-stack_queue.png)
+
+When one client pushes an element to the queue, it will be pushed into stack-1 that works as journal. After that, if
+stack-2 is empty when the other client pops from the queue, the queue first pops all elements from stack-1 and pushes
+them to stack-2. So the queue behaves as FIFO.
