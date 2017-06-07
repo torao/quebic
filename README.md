@@ -20,15 +20,15 @@ impact of file lock as far as you use this as 1:1.
 * Compression option for efficient storing large JSON or vector.
 * Data type verification with simple schema.
 * Simple two-files data store.
-* $n$:$1$ parallel push, parallel pop.
+* 1:1 lock-based parallel push and pop.
 
-## Implementation Guide
+## Sample
 
-You should:
+When you use Quebic in your project, you should:
 
-1. determine what type `T` you want to push into queue.
-2. implement `Value2Struct[T]` to specify schema and transform your queue-data to schema.
-3. determine `capacity` of queue.
+1. determine what type `T` that you want to push into queue.
+2. implement `Value2Struct[T]` to specify schema of queue and transform your queue-data `T` to schema.
+3. determine limit items to keep queue as `capacity`.
 
 ```scala
 import java.io.File
@@ -47,8 +47,8 @@ case object YourData2Struct extends Queue.Value2Struct[YourData] {
   }
 }
 
-val timer = new Timer("ScheduledMigrationThread", true)
-val file = new File("queue.qbc")
+val timer = new Timer("ScheduledMigrationThread")   // scheduled migration thread
+val file = new File("my-queue.qbc")
 val capacity = 64 * 1024
 val queue = new Queue(file, capacity, YourData2Struct, timer)
 
@@ -58,14 +58,27 @@ pub.push(YourData(0, "hello, world"))
 val sub = new queue.Subscriber()
 val yourData = sub.pop()
 
-// when end your program
+// When your program going to finish.
 queue.close()
 timer.cancel()
+
+// If you wish to delete all queue-related files.
+// queue.dispose()
 ```
 
-### Performance
+### Reference Score of Performance
 
-| Operation | Items | Time    | Time/Item |
-|:----------|:------|:--------|----------:|
-| PUSH      | 500   | 6,287ms | 12.6ms  |
-| POP       | 500   | 6,993ms | 14.0ms  |
+Followings are the score of push and pop operation on DELL OptiPlex 7050 with Windows 10, Core i7-7700 3.6GHz CPU, 16GB
+memory, NTFS on HDD (not SSD).
+
+In single thread, push - migration - pop sequential operation for 1kB binary item:
+
+| Operation | Call  | Time     | Time/Call |
+|:----------|------:|---------:|----------:|
+| PUSH      | 2,781 | 10,002ms | 3.597ms   |
+| POP       | 2,781 | 6,114ms  | 2.198ms   |
+| MIGRATION | 2,782 | 52ms     | 0.019ms   |
+
+## Internal Implementation
+
+Quebic is based on double-stack queue.
