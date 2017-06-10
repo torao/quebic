@@ -20,7 +20,7 @@ impact of file lock as far as you use this as 1:1.
 * Compression option for efficient storing large JSON or vector.
 * Data type verification with simple schema.
 * Simple two-files data store.
-* $n$:$1$ parallel push, parallel pop.
+* 1:1 parallel push, parallel pop.
 
 ## Implementation Guide
 
