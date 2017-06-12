@@ -209,7 +209,7 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
       def _pushAll(t0:Long, values:Seq[T]):Seq[T] = {
         // IMPORTANT: デッドロック回避のためマイグレーション時のロック順は journal → queue にすること。
         val remaining = journal { j =>
-          val permitCount = math.min(queue(_.size) + j.size, values.length).toInt
+          val permitCount = math.min(capacity - (queue(_.size) + j.size), values.length).toInt
           if(permitCount > 0) {
             val (permitted, remaining) = values.splitAt(permitCount)
             permitted.foreach(value => j.push(conv.from(value), lifetime, compression))
