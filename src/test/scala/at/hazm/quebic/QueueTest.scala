@@ -1,11 +1,10 @@
 package at.hazm.quebic
 
-import java.io.{File, FileInputStream, IOException, RandomAccessFile}
-import java.nio.channels.FileChannel
+import java.io.{File, IOException}
+import java.util.Timer
 import java.util.concurrent.TimeUnit
-import java.util.{Timer, TimerTask}
 
-import Queue.Value2Struct
+import at.hazm.quebic.Queue.Value2Struct
 import org.specs2.Specification
 import org.specs2.execute.Result
 import org.specs2.specification.core.SpecStructure
@@ -22,6 +21,8 @@ push and pop in multi threads: $multiThreadingPushAndPop
 GZIP compressed push and pop:  ${compression(Codec.GZIP)}
 latest data retrieve:          $leastDataRetrieve
 concurrent lock operation:     $concurrentJournalLocked
+bulk push and retrieve all:    $pushAll
+wait when push over capacity:  $overPushAndPop
 """
 
   def initialState:Result = {
@@ -51,11 +52,11 @@ concurrent lock operation:     $concurrentJournalLocked
     val t0 = System.currentTimeMillis()
     expected.foreach { s => publish.push(s) }
     val t1 = System.currentTimeMillis()
-    System.out.println(f"${expected.length} pushed queue size: ${queue.diskSpace}%,dB [${t1 - t0}%,dms] ${(t1-t0)/expected.length.toDouble}%,.1f[ms/item]")
+    System.out.println(f"${expected.length} pushed queue size: ${queue.diskSpace}%,dB [${t1 - t0}%,dms] ${(t1 - t0) / expected.length.toDouble}%,.1f[ms/item]")
     val pushedSizeEqualsItemCount = queue.size === expected.length
     val actual = expected.indices.map { _ => subscribe.pop() }
     val t2 = System.currentTimeMillis()
-    System.out.println(f"${actual.length} popped queue size: ${queue.diskSpace}%,dB [${t2 - t1}%,dms] ${(t2-t1)/actual.length.toDouble}%,.1f[ms/item]")
+    System.out.println(f"${actual.length} popped queue size: ${queue.diskSpace}%,dB [${t2 - t1}%,dms] ${(t2 - t1) / actual.length.toDouble}%,.1f[ms/item]")
     val elementAllPoped = queue.size === 0
     val poppedElementsAreAllRetrieved = actual.length === expected.length
     val poppedElementsAreAllEquals = actual.zip(expected).map(x => x._1 === x._2).reduceLeft(_ and _)
@@ -93,7 +94,7 @@ concurrent lock operation:     $concurrentJournalLocked
       val t0 = System.currentTimeMillis()
       val data = (expected.length * pushThreadSize / popThreadSize).fill(subscribe.pop(5 * 1000L)).flatten.toList
       val t1 = System.currentTimeMillis()
-      System.out.println(f"  POP: ${expected.length}%,d, ${t1 - t0}%,d[ms] ${(t1-t0)/expected.length.toDouble}%,.1f[ms/item]")
+      System.out.println(f"  POP: ${expected.length}%,d, ${t1 - t0}%,d[ms] ${(t1 - t0) / expected.length.toDouble}%,.1f[ms/item]")
       actual.synchronized(actual.appendAll(data))
       queue.close()
     }
@@ -108,7 +109,7 @@ concurrent lock operation:     $concurrentJournalLocked
       val t0 = System.currentTimeMillis()
       expected.foreach(s => publish.push(s))
       val t1 = System.currentTimeMillis()
-      System.out.println(f"  PUSH: ${expected.length}%,d, ${t1 - t0}%,d[ms] ${(t1-t0)/expected.length.toDouble}%,.1f[ms/item]")
+      System.out.println(f"  PUSH: ${expected.length}%,d, ${t1 - t0}%,d[ms] ${(t1 - t0) / expected.length.toDouble}%,.1f[ms/item]")
       queue.close()
     }
 
@@ -153,11 +154,11 @@ concurrent lock operation:     $concurrentJournalLocked
     val t0 = System.currentTimeMillis()
     expected.foreach { s => publish.push(s) }
     val t1 = System.currentTimeMillis()
-    System.out.println(f"${compress.name}: ${expected.length} pushed queue size: ${queue.diskSpace}%,dB [${t1 - t0}%,dms] ${(t1-t0)/expected.length.toDouble}%,.1f[ms/item]")
+    System.out.println(f"${compress.name}: ${expected.length} pushed queue size: ${queue.diskSpace}%,dB [${t1 - t0}%,dms] ${(t1 - t0) / expected.length.toDouble}%,.1f[ms/item]")
 
     val actual = expected.indices.map { _ => subscribe.pop() }
     val t2 = System.currentTimeMillis()
-    System.out.println(f"${compress.name}: ${actual.length} popped queue size: ${queue.diskSpace}%,dB [${t2 - t1}%,dms] ${(t2-t1)/actual.length.toDouble}%,.1f[ms/item]")
+    System.out.println(f"${compress.name}: ${actual.length} popped queue size: ${queue.diskSpace}%,dB [${t2 - t1}%,dms] ${(t2 - t1) / actual.length.toDouble}%,.1f[ms/item]")
 
     val elementAllPoped = queue.size === 0
     val poppedElementsAreAllRetrieved = actual.length === expected.length
@@ -208,6 +209,73 @@ concurrent lock operation:     $concurrentJournalLocked
     queue.dispose()
 
     (proc.exitValue() === 0) and ((t1 - t0) must be_>=(5000L))
+  }
+
+  def pushAll:Result = {
+    val file = File.createTempFile("test-", ".qbc", new File("."))
+    file.deleteOnExit()
+    val capacity = 10
+    val queue = new Queue[String](file, capacity, String2Struct, timer)
+
+    var actual:Seq[String] = Seq.empty
+    val thread = new Thread() {
+      override def run():Unit = {
+        val subscribe = new queue.Subscriber()
+        Thread.sleep(1500)
+        actual = (0 until capacity * 10).map { _ =>
+          subscribe.pop()
+        }
+      }
+    }
+    thread.start()
+
+    val publish = new queue.Publisher(Codec.PLAIN)
+    val expected = (0 until capacity * 10).map { i =>
+      randomString(8332 + i, 1024)
+    }
+    publish.pushAll(expected)
+
+    thread.join()
+
+    val empty = queue.isEmpty
+
+    queue.dispose()
+
+    (empty must beTrue) and actual.zip(expected).map { case (a, b) => a === b }.reduceLeft(_ and _)
+  }
+
+  def overPushAndPop:Result = {
+    val file = File.createTempFile("test-", ".qbc", new File("."))
+    file.deleteOnExit()
+    val capacity = 1
+    val queue = new Queue[String](file, capacity, String2Struct, timer)
+
+    var actual:Seq[String] = Seq.empty
+    val thread = new Thread() {
+      override def run():Unit = {
+        Thread.sleep(1500)
+        val subscribe = new queue.Subscriber()
+        actual = (0 until capacity * 10).map { _ =>
+          Thread.sleep(500)
+          subscribe.pop()
+        }
+      }
+    }
+    thread.start()
+
+    val publish = new queue.Publisher(Codec.PLAIN)
+    val expected = (0 until capacity * 10).map { i =>
+      randomString(8332 + i, 1024)
+    }
+    expected.foreach(x => publish.push(x))
+
+    thread.join()
+
+    val empty = queue.isEmpty
+
+    queue.dispose()
+
+    (empty must beTrue) and actual.zip(expected).map { case (a, b) => a === b }.reduceLeft(_ and _)
   }
 
   object String2Struct extends Value2Struct[String] {
