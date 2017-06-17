@@ -1,7 +1,9 @@
 package at.hazm.quebic
 
-import java.io.File
-import java.util.Timer
+import java.io.{File, FileInputStream, IOException, RandomAccessFile}
+import java.nio.channels.FileChannel
+import java.util.concurrent.TimeUnit
+import java.util.{Timer, TimerTask}
 
 import Queue.Value2Struct
 import org.specs2.Specification
@@ -19,6 +21,7 @@ push and pop in single thread: $normalPushAndPopInSingleThread
 push and pop in multi threads: $multiThreadingPushAndPop
 GZIP compressed push and pop:  ${compression(Codec.GZIP)}
 latest data retrieve:          $leastDataRetrieve
+concurrent lock operation:     $concurrentJournalLocked
 """
 
   def initialState:Result = {
@@ -31,7 +34,10 @@ latest data retrieve:          $leastDataRetrieve
     queue.close()
     val fileCanDelete = file.delete() must beTrue
     queue.dispose()
-    fileIsEmpty and initialQueueSizeIsZero and fileCanDelete
+
+    val negativeQueueCapacity = new Queue[String](file, -1, String2Struct, timer) must throwA[IllegalArgumentException]
+
+    fileIsEmpty and initialQueueSizeIsZero and fileCanDelete and negativeQueueCapacity
   }
 
   def normalPushAndPopInSingleThread:Result = {
@@ -55,7 +61,11 @@ latest data retrieve:          $leastDataRetrieve
     val poppedElementsAreAllEquals = actual.zip(expected).map(x => x._1 === x._2).reduceLeft(_ and _)
     queue.dispose()
 
-    pushedSizeEqualsItemCount and elementAllPoped and poppedElementsAreAllRetrieved and poppedElementsAreAllEquals
+    val exceptionWhenQueueClosed = queue.size must throwA[IOException]
+    val exceptionWhenClosedQueuePop = subscribe.pop() must throwA[IOException]
+
+    pushedSizeEqualsItemCount and elementAllPoped and poppedElementsAreAllRetrieved and poppedElementsAreAllEquals and
+      exceptionWhenQueueClosed and exceptionWhenClosedQueuePop
   }
 
   def multiThreadingPushAndPop:Result = {
@@ -173,6 +183,31 @@ latest data retrieve:          $leastDataRetrieve
     val emptyQueueRememverLatestData = (queue.isEmpty must beTrue) and (publisher.latest.get === sample)
 
     latestDataOfEmptyQueueIsNone and pushDataSameAsLatestData and emptyQueueRememverLatestData
+  }
+
+  def concurrentJournalLocked:Result = {
+    val file = File.createTempFile("test-", "", new File("."))
+    file.deleteOnExit()
+    val capacity = 10
+    val queue = new Queue[String](file, capacity, String2Struct, timer)
+    val publisher = new queue.Publisher(Codec.PLAIN)
+    val sample = randomString(884, 1024)
+
+    // ファイルを作成しておく
+    publisher.push(sample)
+
+    val journal = new File(file.getParentFile, file.getName + ".qbj")
+    assert(journal.isFile)
+    val t0 = System.currentTimeMillis()
+    val proc = ScriptRunner.execJar("bin/filelockj-1.0.0.jar", journal.getName, "5")
+    Thread.sleep(1500L)
+    publisher.push(sample)
+    val t1 = System.currentTimeMillis()
+
+    proc.waitFor(10, TimeUnit.SECONDS)
+    queue.dispose()
+
+    (proc.exitValue() === 0) and ((t1 - t0) must be_>=(5000L))
   }
 
   object String2Struct extends Value2Struct[String] {

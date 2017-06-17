@@ -16,13 +16,14 @@ import scala.annotation.tailrec
   * キューはスキーマ (タプル形式のデータ型) を定義できます。このスキーマを使用してキューの投入側と取得側で安全にデータを変換することが
   * できます。任意のユーザ定義データを透過的に扱うために構築時に `Struct` へのコンバーター実装である `Value2Struct` を指定します。
   *
-  * @param file     キューに使用するファイル
-  * @param capacity キューの容量
-  * @param conv     任意のデータを [[Struct]] 型に変換するコンバーター
-  * @param timer    ジャーナルからキューへデータの移行処理を行うタイマー
+  * @param file                  キューに使用するファイル
+  * @param capacity              キューの容量
+  * @param conv                  任意のデータを [[Struct]] 型に変換するコンバーター
+  * @param timer                 ジャーナルからキューへデータの移行処理を行うタイマー
+  * @param autoMigrationInterval 自動マイグレーションの起動間隔 (ミリ秒)
   * @tparam T このキューに投入または取り出す型
   */
-class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Timer) extends AutoCloseable {
+class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Timer, autoMigrationInterval:Long = 1000L) extends AutoCloseable {
   if(capacity <= 0) {
     throw new IllegalArgumentException(f"queue capacity $capacity%,d must be larger than zero")
   }
@@ -58,7 +59,7 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
     }
   }
 
-  timer.scheduleAtFixedRate(migrateTask, 1000, 1000)
+  timer.scheduleAtFixedRate(migrateTask, autoMigrationInterval, autoMigrationInterval)
 
   private[this] val closed = new AtomicBoolean(false)
 
@@ -114,7 +115,7 @@ class Queue[T](val file:File, val capacity:Long, conv:Value2Struct[T], timer:Tim
     *
     * @return キューのデータ数
     */
-  def size:Long = if(journalFile.length() < 0) {
+  def size:Long = if(journalFile.length() <= 0) {
     queue(_.size)
   } else both { (a, b) => a.size + b.size }
 

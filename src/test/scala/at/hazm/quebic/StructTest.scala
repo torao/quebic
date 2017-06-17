@@ -1,5 +1,7 @@
 package at.hazm.quebic
 
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream}
+
 import org.specs2.Specification
 import org.specs2.execute.Result
 import org.specs2.specification.core.SpecStructure
@@ -8,6 +10,7 @@ class StructTest extends Specification {
   override def is:SpecStructure =
     s2"""
 data and type to string: $dataToString
+serialize: $serialize
 tensor data test: $tensor
 """
 
@@ -25,6 +28,19 @@ tensor data test: $tensor
     }
     success
   }
+
+  def serialize:Result = Seq(
+    Struct.INTEGER(0),
+    Struct.REAL(0.0),
+    Struct.TEXT((0 to 0xFF).map(_.toChar).toString()),
+    Struct.BINARY((0 to 0xFF).map(_.toByte).toArray),
+    Struct.TENSOR.fromTensor(Seq(Seq(1)))
+  ).map { data =>
+    val schema = Schema(data.dataType)
+    val other = schema.deserialize(schema.serialize(Struct(data), Codec.PLAIN), Codec.PLAIN).values.head
+
+    data.value === other.value
+  }.reduceLeft(_ and _)
 
   def tensor:Result = {
 
