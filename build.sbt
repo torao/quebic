@@ -27,22 +27,22 @@ pomIncludeRepository := { _ => false }
 
 sonatypeProfileName := "at.hazm"
 
-pomExtra :=
-  <url>https://github.com/torao/quebic</url>
-    <licenses>
-      <license>
-        <name>Apache-2.0</name>
-        <url>https://www.apache.org/licenses/LICENSE-2.0</url>
-      </license>
-    </licenses>
-    <scm>
-      <url>https://github.com/torao/quebic</url>
-      <connection>https://github.com/torao/quebic.git</connection>
-    </scm>
-    <developers>
-      <developer>
-        <id>torao</id>
-        <name>TAKAMI Toral</name>
-        <url>http://hazm.at</url>
-      </developer>
-    </developers>
+licenses := Seq("Apache-2.0" -> url("https://www.apache.org/licenses/LICENSE-2.0"))
+
+homepage := Some(url("https://github.com/torao/quebic"))
+
+scmInfo := Some(
+  ScmInfo(
+    url("https://github.com/torao/quebic"),
+    "https://github.com/torao/quebic.git"
+  )
+)
+
+developers := List(
+  Developer(
+    id    = "torao",
+    name  = "TAKAMI Torao",
+    email = "koiroha@gmail.com",
+    url   = url("http://hazm.at")
+  )
+)
